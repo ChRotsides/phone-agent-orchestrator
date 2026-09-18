@@ -1,0 +1,9 @@
+node_modules/
+certs/
+state/
+jobs.jsonl
+.env
+app/build/
+app/.dart_tool/
+app/android/.gradle/
+.jarvis-worktrees/
