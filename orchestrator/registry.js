@@ -24,6 +24,8 @@ export function createJob(fields) {
     beats: [],
     ...fields,
   };
+  // Lets a replacement job wait for the one it supersedes to actually stop.
+  job.finished = new Promise((resolve) => { job.resolveFinished = resolve; });
   jobs.set(job.id, job);
   persist('create', job);
   bus.emit('job', { type: 'created', job });
@@ -38,10 +40,11 @@ export function addBeat(job, beat) {
 }
 
 export function finishJob(job, result) {
-  job.state = result.ok ? 'done' : result.cancelled ? 'cancelled' : 'failed';
+  job.state = result.cancelled ? 'cancelled' : result.ok ? 'done' : 'failed';
   job.result = result;
   job.finishedAt = Date.now();
   persist('finish', job);
+  job.resolveFinished?.(job);
   bus.emit('job', { type: 'finished', job });
 }
 
@@ -68,10 +71,14 @@ export function describeJob(job, { verbose = false } = {}) {
     return `${head} — ${age}${job.lastBeat ? `, currently ${job.lastBeat}` : ''}${edits ? `, ${edits} file operations so far` : ''}.`;
   }
   if (job.state === 'done') {
+    if (job.kind === 'explore') {
+      // The agent's own headline, not a paraphrase of it.
+      return `Exploration job ${job.id}${job.project?.name ? ` in ${job.project.name}` : ''} has finished. Its headline finding, in its own words: "${job.headline || 'no headline given'}" The full report is ready to read out.`;
+    }
     return `${head} — finished${job.changes ? `, ${job.changes}` : ''}${job.branch ? `, on branch ${job.branch}` : ''}.${verbose && job.result?.summary ? ` It reports: ${job.result.summary.slice(0, 400)}` : ''}`;
   }
   if (job.state === 'failed') return `${head} — failed. ${job.result?.summary?.slice(0, 300) || ''}`;
-  if (job.state === 'cancelled') return `${head} — cancelled.`;
+  if (job.state === 'cancelled') return `${head} — cancelled${job.replacedBy ? `, replaced by job ${job.replacedBy}` : ''}.`;
   return `${head} — ${job.state}.`;
 }
 

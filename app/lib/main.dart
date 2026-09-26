@@ -48,7 +48,10 @@ class _HomeState extends State<Home> {
   @override
   void initState() {
     super.initState();
-    link.loadPrefs();
+    link.loadPrefs().then((_) {
+      link.refreshSessions();
+      link.refreshJobs();
+    });
     link.addListener(() => setState(() {}));
   }
 
@@ -220,7 +223,14 @@ class _VoiceViewState extends State<VoiceView> with SingleTickerProviderStateMix
           if (link.sessionName != null)
             Text('session · ${link.sessionName}',
                 textAlign: TextAlign.center, style: const TextStyle(color: Color(0x905BD8FF), fontSize: 10)),
-          Text(link.diag, textAlign: TextAlign.center, style: const TextStyle(color: Color(0x705BD8FF), fontSize: 10)),
+          Text(
+              [
+                link.diag,
+                if (link.audioBytes > 0) 'heard ${(link.audioBytes / 48000).toStringAsFixed(1)}s',
+                if (link.live) link.aec ? 'aec on' : 'aec off',
+              ].where((t) => t.isNotEmpty).join('  ·  '),
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Color(0x705BD8FF), fontSize: 10)),
           const SizedBox(height: 10),
           Expanded(
             child: Container(
@@ -244,12 +254,20 @@ class _VoiceViewState extends State<VoiceView> with SingleTickerProviderStateMix
                 onTap: () => link.live ? link.disconnect() : link.connect(),
               ),
             ),
-            const SizedBox(width: 10),
+            const SizedBox(width: 8),
             Expanded(
               child: JButton(
                 label: link.muted ? 'UNMUTE' : 'MUTE',
                 color: link.muted ? amber : cyan,
                 onTap: link.live ? link.toggleMute : null,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: JButton(
+                label: link.speaker ? 'SPEAKER' : 'EARPIECE',
+                color: link.speaker ? cyan : amber,
+                onTap: link.live ? link.toggleSpeaker : null,
               ),
             ),
           ]),
@@ -568,7 +586,10 @@ class JButton extends StatelessWidget {
           border: Border.all(color: color.withValues(alpha: on ? 0.6 : 0.2)),
           borderRadius: BorderRadius.circular(10),
         ),
-        child: Text(label, style: TextStyle(color: color.withValues(alpha: on ? 1 : 0.4), fontSize: 13, letterSpacing: 3)),
+        child: Text(label,
+            maxLines: 1,
+            overflow: TextOverflow.visible,
+            style: TextStyle(color: color.withValues(alpha: on ? 1 : 0.4), fontSize: 11, letterSpacing: 1.5)),
       ),
     );
   }

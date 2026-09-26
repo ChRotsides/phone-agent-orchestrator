@@ -3,7 +3,9 @@ import { EXECUTORS } from './executors.js';
 import { isLimited, limitedExecutors } from './registry.js';
 
 const BASE = process.env.QWEN_BASE_URL || 'https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1';
-const BRAIN = process.env.ORCHESTRATOR_MODEL || 'qwen3.8-max';
+// Routing is a 7-way classification, not deep reasoning: the flash model is both
+// faster and adequate, with the deterministic guards below catching its mistakes.
+const BRAIN = process.env.ORCHESTRATOR_MODEL || 'qwen3.8-flash';
 
 const ROUTER_PROMPT = `You route coding tasks to one of several agent CLIs. Answer with JSON only.
 
@@ -16,6 +18,8 @@ Rules of thumb:
 - Architecture changes, multi-file refactors, subtle debugging, anything the user calls hard/important -> "deep" tier.
 - Prefer claude:* for sprawling repo-wide reasoning, codex:* for precise test-driven code work, qoder:max when the others are limited.
 - Never pick an executor listed as unavailable.
+- When genuinely unsure, choose a "mid" tier executor rather than guessing high or low.
+- An exploration or read-only investigation of a large codebase is "normal" unless the question is subtle.
 
 Reply as JSON: {"executor":"<key>","difficulty":"trivial|normal|hard","why":"<12 words max>","clarify":"<question or empty>"}
 Set "clarify" only if the task is too vague to start at all.`;
@@ -43,8 +47,8 @@ export function explicitChoice(text = '') {
   return alias?.[1] || null;
 }
 
-export async function route(task, { hint } = {}) {
-  const forced = explicitChoice(hint || '') || explicitChoice(task);
+export async function route(task, { hint, spoken } = {}) {
+  const forced = explicitChoice(hint || '') || explicitChoice(spoken || '') || explicitChoice(task);
   if (forced) return { executor: forced, difficulty: 'unknown', why: 'you asked for it', forced: true };
 
   try {

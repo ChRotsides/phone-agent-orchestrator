@@ -68,11 +68,17 @@ class JarvisLink extends ChangeNotifier {
   String diag = '';
   String host = '192.168.0.226:8443';
   bool muted = false;
+  bool speaker = true;
+  bool aec = false;
   bool speaking = false;
+  int audioBytes = 0;
   double level = 0;
   int _frames = 0;
 
   final List<Line> transcript = [];
+  // Where the reply being streamed right now lives, so each response is its own
+  // bubble and a late transcription can be slotted in above it.
+  int? _replyAt;
   List<Job> jobs = [];
   List<SessionSummary> sessions = [];
   String? sessionId;
@@ -111,6 +117,12 @@ class JarvisLink extends ChangeNotifier {
       send({'type': 'jarvis.session.start', if (resumeId != null) 'id': resumeId, if (name != null) 'name': name});
 
       await _audio.invokeMethod('start');
+      _audio.invokeMethod('status').then((r) {
+        if (r is Map) {
+          aec = r['aec'] == true;
+          notifyListeners();
+        }
+      }).catchError((Object _) {});
       _micSub = _mic.receiveBroadcastStream().listen(_onMicChunk);
 
       if (resumeId == null) transcript.clear();
@@ -136,14 +148,54 @@ class JarvisLink extends ChangeNotifier {
     } catch (_) {}
   }
 
+  void toggleSpeaker() {
+    speaker = !speaker;
+    _audio.invokeMethod('speaker', {'value': speaker});
+    notifyListeners();
+  }
+
   void toggleMute() {
     muted = !muted;
     _audio.invokeMethod('mute', {'value': muted});
     notifyListeners();
   }
 
-  void refreshJobs() => send({'type': 'jarvis.jobs.refresh'});
-  void refreshSessions() => send({'type': 'jarvis.session.list'});
+  void refreshJobs() {
+    send({'type': 'jarvis.jobs.refresh'});
+    _fetch('/api/jobs').then((data) {
+      if (data is List && (data.isNotEmpty || jobs.isEmpty)) {
+        jobs = data.reversed.map((j) => Job.fromJson(j as Map<String, dynamic>)).toList();
+        notifyListeners();
+      }
+    });
+  }
+
+  void refreshSessions() {
+    send({'type': 'jarvis.session.list'});
+    _fetch('/api/sessions').then((data) {
+      if (data is List && (data.isNotEmpty || sessions.isEmpty)) {
+        sessions = data.map((s) => SessionSummary.fromJson(s as Map<String, dynamic>)).toList();
+        notifyListeners();
+      }
+    });
+  }
+
+  /// Plain REST against the host, independent of the voice websocket.
+  Future<dynamic> _fetch(String path) async {
+    try {
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
+      client.badCertificateCallback = (_, _, _) => true;
+      final req = await client.getUrl(Uri.parse('https://$host$path'));
+      final res = await req.close();
+      final body = await res.transform(utf8.decoder).join();
+      client.close();
+      return jsonDecode(body);
+    } catch (e) {
+      diag = 'host unreachable: ${e.toString().split(':').first}';
+      notifyListeners();
+      return null;
+    }
+  }
   void openSession(String id) => send({'type': 'jarvis.session.open', 'id': id});
   void renameSession(String id, String name) => send({'type': 'jarvis.session.rename', 'id': id, 'name': name});
   void deleteSession(String id) => send({'type': 'jarvis.session.delete', 'id': id});
@@ -172,7 +224,18 @@ class JarvisLink extends ChangeNotifier {
     final e = jsonDecode(raw as String) as Map<String, dynamic>;
     switch (e['type']) {
       case 'response.audio.delta':
-        _audio.invokeMethod('play', {'pcm': base64Decode(e['delta'] as String)});
+        final pcm = base64Decode(e['delta'] as String);
+        _audio.invokeMethod('play', {'pcm': pcm}).then((r) {
+          // Surfacing what the speaker actually accepted turns silence into a number.
+          if (r is Map && r['total'] is int) {
+            audioBytes = r['total'] as int;
+            final lost = r['dropped'];
+            if (lost is int && lost > 0) diag = 'audio dropped ${lost}B';
+          }
+        }).catchError((Object e) {
+          diag = 'audio error: $e';
+          notifyListeners();
+        });
         if (!speaking) {
           speaking = true;
           notifyListeners();
@@ -180,6 +243,7 @@ class JarvisLink extends ChangeNotifier {
         break;
       case 'response.audio.done':
       case 'response.done':
+        _replyAt = null;
         speaking = false;
         status = 'online — speak, sir';
         notifyListeners();
@@ -195,10 +259,34 @@ class JarvisLink extends ChangeNotifier {
         notifyListeners();
         break;
       case 'conversation.item.input_audio_transcription.completed':
-        _addLine('you', (e['transcript'] as String?)?.trim() ?? '');
+        // Speech recognition finishes after JARVIS has begun replying, so the line
+        // belongs above the answer it prompted, not below it.
+        final said = (e['transcript'] as String?)?.trim() ?? '';
+        if (said.isEmpty) break;
+        if (_replyAt != null && _replyAt! <= transcript.length) {
+          transcript.insert(_replyAt!, Line('you', said));
+          _replyAt = _replyAt! + 1;
+          notifyListeners();
+        } else {
+          _addLine('you', said);
+        }
+        break;
+      case 'response.created':
+        _replyAt = null; // next delta opens a fresh bubble
         break;
       case 'response.audio_transcript.delta':
         _appendAssistant(e['delta'] as String);
+        break;
+      case 'response.audio_transcript.done':
+        // The final transcript is authoritative; streamed deltas can drop fragments.
+        final full = (e['transcript'] as String?)?.trim() ?? '';
+        if (_replyAt != null && full.isNotEmpty && _replyAt! < transcript.length) {
+          transcript[_replyAt!].text = full;
+          notifyListeners();
+        } else if (full.isNotEmpty && _replyAt == null) {
+          _addLine('jarvis', full);
+        }
+        _replyAt = null;
         break;
       case 'jarvis.tool':
         final p = e['args']?['project'];
@@ -211,11 +299,15 @@ class JarvisLink extends ChangeNotifier {
       case 'jarvis.session':
         final s = e['session'];
         if (s != null) {
+          final isNewSession = sessionId != s['id'];
           sessionId = s['id'];
           sessionName = s['name'];
-          transcript
-            ..clear()
-            ..addAll(((s['lines'] ?? []) as List).map((l) => Line(l['who'], l['text'], at: l['at'])));
+          if (isNewSession || transcript.isEmpty) {
+            transcript
+              ..clear()
+              ..addAll(((s['lines'] ?? []) as List).map((l) => Line(l['who'], l['text'], at: l['at'])));
+            _replyAt = null;
+          }
           notifyListeners();
         }
         break;
@@ -238,10 +330,11 @@ class JarvisLink extends ChangeNotifier {
   }
 
   void _appendAssistant(String delta) {
-    if (transcript.isEmpty || transcript.last.who != 'jarvis') {
+    if (_replyAt == null || _replyAt! >= transcript.length) {
       transcript.add(Line('jarvis', delta));
+      _replyAt = transcript.length - 1;
     } else {
-      transcript.last.text += delta;
+      transcript[_replyAt!].text += delta;
     }
     notifyListeners();
   }

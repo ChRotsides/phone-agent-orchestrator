@@ -14,6 +14,8 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 // Voice I/O for the realtime link: 16 kHz PCM16 up, 24 kHz PCM16 down,
@@ -33,6 +35,17 @@ class MainActivity : FlutterActivity() {
     private var effects = mutableListOf<android.media.audiofx.AudioEffect>()
     private var speaker = true
     private var bytesPlayed = 0L
+    private var aecOn = false
+    // The model streams a reply faster than it plays. Queue it and let a writer thread
+    // drain at the speed of sound, or AudioTrack silently drops everything past its buffer.
+    private val playQueue = LinkedBlockingQueue<ByteArray>()
+    private var dropped = 0L
+    @Volatile private var playing = false
+    // While the speaker is active the microphone hears JARVIS. Anything quieter than
+    // the barge-in bar during that window is treated as echo and never leaves the phone.
+    @Volatile private var speakingUntilMs = 0L
+    private val echoTailMs = 250L
+    private val bargeInPeak = 7000 // ~ -13 dBFS: a real voice over the speaker, not its leakage
     private val am by lazy { getSystemService(AUDIO_SERVICE) as AudioManager }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -68,13 +81,15 @@ class MainActivity : FlutterActivity() {
                 "mute" -> { muted = call.argument<Boolean>("value") ?: false; result.success(true) }
                 "play" -> {
                     val bytes = call.argument<ByteArray>("pcm")
-                    var wrote = 0
-                    if (bytes != null) {
-                        wrote = track?.write(bytes, 0, bytes.size, AudioTrack.WRITE_NON_BLOCKING) ?: -1
-                        if (wrote > 0) bytesPlayed += wrote
+                    if (bytes != null && track != null) {
+                        playQueue.put(bytes)
+                        bytesPlayed += bytes.size
+                        // 24 kHz, 16-bit mono => 48000 bytes per second of speech.
+                        val ms = bytes.size * 1000L / 48000L
+                        speakingUntilMs = maxOf(speakingUntilMs, System.currentTimeMillis()) + ms
                     }
                     // The Dart side surfaces this, so silence is diagnosable from the phone.
-                    result.success(mapOf("wrote" to wrote, "total" to bytesPlayed, "state" to (track?.playState ?: -1)))
+                    result.success(mapOf("queued" to playQueue.size, "total" to bytesPlayed, "dropped" to dropped))
                 }
                 "speaker" -> {
                     speaker = call.argument<Boolean>("value") ?: true
@@ -82,11 +97,14 @@ class MainActivity : FlutterActivity() {
                     result.success(speaker)
                 }
                 "clear" -> { // barge-in: drop everything still queued for playback
+                    playQueue.clear()
                     track?.let { t ->
                         try { t.pause(); t.flush(); t.play() } catch (_: Exception) {}
                     }
+                    speakingUntilMs = 0
                     result.success(true)
                 }
+                "status" -> result.success(mapOf("aec" to aecOn, "speaker" to speaker, "played" to bytesPlayed, "queued" to playQueue.size))
                 else -> result.notImplemented()
             }
         }
@@ -113,7 +131,7 @@ class MainActivity : FlutterActivity() {
 
         val outBuf = AudioTrack.getMinBufferSize(
             outputRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT,
-        ).coerceAtLeast(outputRate) * 2
+        ).coerceAtLeast(outputRate * 2) * 2 // ~2 s of headroom
         track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -133,6 +151,20 @@ class MainActivity : FlutterActivity() {
             .build()
         track?.play()
 
+        playing = true
+        thread(name = "jarvis-speaker") {
+            while (playing || playQueue.isNotEmpty()) {
+                val chunk = playQueue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                var off = 0
+                while (off < chunk.size) {
+                    // Blocking writes apply back-pressure instead of discarding the tail.
+                    val n = track?.write(chunk, off, chunk.size - off, AudioTrack.WRITE_BLOCKING) ?: -1
+                    if (n <= 0) { dropped += (chunk.size - off); break }
+                    off += n
+                }
+            }
+        }
+
         val inBuf = AudioRecord.getMinBufferSize(
             inputRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
         ).coerceAtLeast(inputRate)
@@ -142,7 +174,7 @@ class MainActivity : FlutterActivity() {
         )
 
         record?.audioSessionId?.let { id ->
-            if (AcousticEchoCanceler.isAvailable()) AcousticEchoCanceler.create(id)?.also { it.enabled = true; effects.add(it) }
+            if (AcousticEchoCanceler.isAvailable()) AcousticEchoCanceler.create(id)?.also { it.enabled = true; aecOn = it.enabled; effects.add(it) }
             if (NoiseSuppressor.isAvailable()) NoiseSuppressor.create(id)?.also { it.enabled = true; effects.add(it) }
             if (AutomaticGainControl.isAvailable()) AutomaticGainControl.create(id)?.also { it.enabled = true; effects.add(it) }
         }
@@ -157,7 +189,20 @@ class MainActivity : FlutterActivity() {
                 val n = record?.read(frame, 0, frame.size) ?: -1
                 if (n <= 0) continue
                 val chunk = frame.copyOf(n)
-                if (muted) java.util.Arrays.fill(chunk, 0)
+
+                // Peak of this frame, used to tell a real interruption from speaker leakage.
+                var peak = 0
+                var i = 0
+                while (i + 1 < n) {
+                    val v = ((chunk[i + 1].toInt() shl 8) or (chunk[i].toInt() and 0xFF)).toShort().toInt()
+                    val a = if (v < 0) -v else v
+                    if (a > peak) peak = a
+                    i += 2
+                }
+
+                val echoWindow = System.currentTimeMillis() < speakingUntilMs + echoTailMs
+                if (muted || (echoWindow && peak < bargeInPeak)) java.util.Arrays.fill(chunk, 0)
+
                 val sink = micSink ?: continue
                 runOnUiThread { sink.success(chunk) }
             }
@@ -166,6 +211,8 @@ class MainActivity : FlutterActivity() {
 
     private fun stopAudio() {
         capturing = false
+        playing = false
+        playQueue.clear()
         try {
             if (Build.VERSION.SDK_INT >= 31) am.clearCommunicationDevice()
             am.mode = AudioManager.MODE_NORMAL

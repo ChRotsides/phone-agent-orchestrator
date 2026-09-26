@@ -23,17 +23,68 @@ if (!API_KEY || !UPSTREAM) {
   process.exit(1);
 }
 
-const INSTRUCTIONS = `You are JARVIS, the user's personal AI assistant, reachable by phone.
-Voice: dry British wit, calm precision, complete confidence. Call the user "sir" occasionally, never every sentence.
-Keep spoken replies to one or two sentences unless asked to elaborate. Never read out logs, code or file paths verbatim — describe them.
+const INSTRUCTIONS = `You are JARVIS, the user's personal AI assistant. You are SPEAKING ALOUD: your words are
+synthesised and played through the user's phone, and you hear them through its microphone. This is a voice call, not a
+text chat. Never say you are text-only or that you cannot speak — you can, and you are.
 
-You command a fleet of coding agents on the user's PC. When the user asks for work to be DONE, call dispatch_task immediately;
-do not ask which model to use — that is chosen for you — but honour it if the user names one.
-When the user asks what is happening, call check_status and report it naturally.
-When the user says to merge, ship or land work, call merge_job.
-When the user asks to clear, reset or restart a project's session, call clear_session.
-If a tool returns a question, ask the user that question in your own words.
-Answer general questions yourself without tools. Always reply in the language the user speaks.`;
+Voice: dry British wit, calm precision, complete confidence. Call the user "sir" occasionally, never every sentence.
+One or two sentences unless asked to elaborate. Never read out logs, code or file paths verbatim — describe them.
+
+You command a fleet of coding agents running on the user's PC. Through them you can do ANYTHING that can be done on
+that machine: read and inspect any codebase, search files and directories, explain how code works, audit, debug,
+investigate why something behaves the way it does, run commands and tests, write and refactor code, and check on
+your own source — this system is the "phone-agent-orchestrator" project, and you can dispatch an agent to examine it
+like any other.
+
+So: when the user asks you to look at, check, inspect, find, investigate, diagnose or explain ANYTHING on the machine,
+call dispatch_task. That IS your capability. Never reply that a request is outside what you can do, that you cannot
+inspect files or directories, or that your tools are limited to managing tasks — dispatch a task instead and report
+what comes back. The only things you answer yourself are general conversation and questions about jobs you have run.
+
+Questions ABOUT code — how does this work, where is this, why does it do that, what is the architecture — go to
+explore_codebase, which sends an agent to investigate and write a report. Changes TO code go to dispatch_task.
+
+When an exploration finishes you announce its headline finding in the agent's own words, and offer the full report.
+If the user asks to expand, to hear it all, what exactly it found, or to continue, call read_report.
+You can also read any file on the PC aloud with read_file, and find one with find_file when the name is vague.
+
+READING ALOUD IS A DISTINCT MODE. A tool result containing a "verbatim" field is someone else's words — an agent's
+report, or a file's contents. SPEAK IT EXACTLY AS WRITTEN, word for word, in full, to the end. Do not summarise it,
+shorten it, rephrase it, correct it, or add commentary before or after. You are reading it aloud on their behalf, not
+describing it. If more parts remain, read this part fully, then offer to continue.
+
+When the user says "expand on that", "read it to me", "what exactly did it say", "the whole thing" or "continue", work
+out from the conversation WHAT they mean: the report of the exploration you just announced (read_report), the file you
+were just discussing or that you just named (read_file), or the next part of whatever you were already reading. Choose
+it yourself from context. Only if it is genuinely unclear, ask in one short sentence which they mean.
+
+LOOK BEFORE YOU LEAP. Checking, measuring, reading and investigating (read_only) you start straight away. Anything that
+CHANGES the machine — creating, renaming, moving, deleting, editing, installing, committing — you first restate in one
+sentence exactly what will happen, including any name, location or detail you picked yourself, and wait for a clear yes.
+"Wait", "hold on", "no", or a sentence that trails off is NOT a yes: stop and listen. If the user asks you to choose
+something, such as a name, propose it and ask; never act on your own proposal until they accept it. A remark about
+something else ("that's good", "thanks") is not approval of a pending plan.
+
+CORRECTIONS REPLACE, THEY DO NOT ADD. If the user corrects or changes a job you already dispatched ("no, not X, Y"),
+dispatch the corrected task with replaces set to that job's id — never start a second job alongside the first. If they
+say stop, cancel or never mind about a job, call cancel_task.
+
+Do not ask which model to use — that is chosen for you — but if the user names one ("sonnet", "opus", "codex"), pass it
+as executor_hint, and keep using it for follow-ups when they say "still" or "same one".
+
+LISTENING. You hear the user through speech recognition, which is imperfect. If what you hear is a fragment or stops
+mid-sentence, say at most "Go on, sir" and wait for the rest instead of acting on it. Speak English. A lone syllable or
+character in another language (a single Chinese or Japanese character, say) is the recogniser mishearing noise: ignore
+it. Only switch language if the user clearly speaks whole sentences in another one, and switch back when they do.
+If you are cut off mid-sentence, the user wanted to speak: respond to what they said, and do not restart what you were
+saying unless they ask.
+
+When the user asks what is happening, call check_status. When they say merge, ship or land, call merge_job.
+When they say clear or reset a project's session, call clear_session. To find a project, call list_projects with a
+filter word rather than guessing. If a tool returns a question, ask it in your own words.`;
+
+// Silence that ends the user's turn. Long enough to survive a mid-sentence pause.
+const TURN_DETECTION = { type: 'server_vad', threshold: 0.55, silence_duration_ms: 1200 };
 
 const app = express();
 app.use(express.json());
@@ -123,6 +174,10 @@ wss.on('connection', (client) => {
 
   let lastAudioAt = Date.now();
   let conversation = null;
+  // Self-interruption watch: an interrupt landing while JARVIS is still talking is
+  // almost always his own voice coming back through the microphone.
+  let speakingUntil = 0;
+  let selfCuts = 0;
 
   const pushJobs = () => toPhone({ type: 'jarvis.jobs', jobs: registry.allJobs().slice(-30).reverse().map(jobView) });
   const pushSessions = () => toPhone({ type: 'jarvis.sessions', sessions: sessions.listConversations(30) });
@@ -152,17 +207,69 @@ wss.on('connection', (client) => {
     conversation = sessions.getConversation(conversation.id) || conversation;
   };
 
-  // The model rejects overlapping responses, so requests queue behind the one in flight.
+  // The model rejects overlapping responses, so a request made while one is in flight waits
+  // for it. One response answers everything added before it, so a follow-up only goes out
+  // when something new has arrived since; otherwise JARVIS repeats himself.
   let responseActive = false;
-  const queued = [];
+  let awaitingCreated = false;
+  let wantResponse = false;
+  let unanswered = 0;
+  const addItem = (item) => {
+    toModel({ type: 'conversation.item.create', item });
+    unanswered++;
+  };
   const requestResponse = () => {
-    if (responseActive) { queued.push(1); return; }
+    if (responseActive) { wantResponse = true; return; }
     responseActive = true;
+    awaitingCreated = true;
+    wantResponse = false;
+    unanswered = 0;
     toModel({ type: 'response.create' });
   };
-  const responseFinished = () => {
+
+  // Barge-in: when the user talks over JARVIS the reply is cancelled, and what is still
+  // streaming for it never reaches the phone.
+  let userSpeaking = false;
+  let cutting = false;
+
+  // Each finished job is announced once. An announcement the user talks over is restated
+  // after they have been answered.
+  const announcements = new Map(); // job id -> { line, state: 'queued' | 'speaking' }
+  const announced = new Set();
+  const queueAnnouncement = (text) => {
+    addItem({ type: 'message', role: 'user', content: [{ type: 'input_text', text }] });
+    requestResponse();
+  };
+  const announcementsCut = () => {
+    const cut = [...announcements].filter(([, a]) => a.state === 'speaking');
+    if (!cut.length) return;
+    for (const [, a] of cut) a.state = 'queued';
+    addItem({ type: 'message', role: 'user', content: [{ type: 'input_text',
+      text: `[SYSTEM EVENT — the user spoke over you while you were reporting ${cut.map(([id]) => `job ${id}`).join(' and ')}. Answer what they say first, then briefly restate the result] ${cut.map(([, a]) => a.line).join(' ')}` }] });
+    // Normally the user's own turn triggers the next reply; if it was only noise, restate anyway.
+    setTimeout(() => {
+      if ([...announcements.values()].some((a) => a.state === 'queued') && !responseActive && !userSpeaking) requestResponse();
+    }, 6000);
+  };
+
+  const responseStarted = () => {
+    responseActive = true;
+    cutting = false;
+    // A reply the server started on its own (end of the user's turn) also covers what came before.
+    if (awaitingCreated) awaitingCreated = false;
+    else unanswered = 0;
+    for (const a of announcements.values()) if (a.state === 'queued') a.state = 'speaking';
+  };
+  const responseFinished = (res) => {
+    const wasCut = cutting || res?.status === 'cancelled';
     responseActive = false;
-    if (queued.length) { queued.pop(); setTimeout(requestResponse, 50); }
+    cutting = false;
+    if (wasCut) announcementsCut();
+    else {
+      for (const [id, a] of announcements) if (a.state === 'speaking') { announcements.delete(id); announced.add(id); }
+    }
+    if (wantResponse && unanswered > 0 && !userSpeaking) setTimeout(requestResponse, 50);
+    else if (!userSpeaking) wantResponse = false;
   };
 
   upstream.on('open', () => {
@@ -175,7 +282,7 @@ wss.on('connection', (client) => {
         input_audio_format: 'pcm16',
         output_audio_format: 'pcm16',
         input_audio_transcription: { model: 'fun-asr' },
-        turn_detection: { type: 'server_vad', threshold: 0.3, silence_duration_ms: 700 },
+        turn_detection: TURN_DETECTION,
         tools: toolSchemas,
         tool_choice: 'auto',
       },
@@ -191,13 +298,12 @@ wss.on('connection', (client) => {
   const onJob = (ev) => {
     pushJobs();
     if (ev.type !== 'finished') return;
-    const line = registry.describeJob(ev.job, { verbose: true });
-    toModel({
-      type: 'conversation.item.create',
-      item: { type: 'message', role: 'user', content: [{ type: 'input_text',
-        text: `[SYSTEM EVENT — announce this to the user in one short sentence, in your own words, then stop] ${line}` }] },
-    });
-    requestResponse();
+    const { job } = ev;
+    // A job replaced by a correction is not news; its replacement reports instead.
+    if (job.replacedBy || announced.has(job.id) || announcements.has(job.id)) return;
+    const line = registry.describeJob(job, { verbose: true });
+    announcements.set(job.id, { line, state: 'queued' });
+    queueAnnouncement(`[SYSTEM EVENT — announce this to the user in one short sentence, in your own words, then stop] ${line}`);
   };
   bus.on('job', onJob);
 
@@ -215,14 +321,34 @@ wss.on('connection', (client) => {
       console.log(`[tool] -> ${result.say}`);
       toPhone({ type: 'jarvis.tool_result', name: e.name, result });
 
-      toModel({
-        type: 'conversation.item.create',
-        item: { type: 'function_call_output', call_id: e.call_id, output: JSON.stringify(result) },
-      });
+      addItem({ type: 'function_call_output', call_id: e.call_id, output: JSON.stringify(result) });
       requestResponse();
       return;
     }
 
+    // What was still streaming for a reply the user talked over.
+    if (cutting && /^response\.(audio|audio_transcript|text)\.delta$/.test(e.type)) return;
+
+    if (e.type === 'response.audio.delta' && e.delta) {
+      const ms = (Buffer.from(e.delta, 'base64').length / 48000) * 1000; // 24 kHz PCM16
+      speakingUntil = Math.max(speakingUntil, Date.now()) + ms;
+    }
+    if (e.type === 'input_audio_buffer.speech_started') {
+      userSpeaking = true;
+      const overlap = speakingUntil - Date.now();
+      if (overlap > 0) {
+        selfCuts++;
+        console.log(`[vad] interrupt while speaking — ${Math.round(overlap)}ms of audio left (self-cut #${selfCuts})`);
+      }
+      // The phone has already dropped its queued audio; stop the model producing more.
+      if (responseActive && !cutting) {
+        cutting = true;
+        speakingUntil = 0;
+        toModel({ type: 'response.cancel' });
+        console.log('[vad] user spoke over the reply — cancelled it');
+      }
+    }
+    if (e.type === 'input_audio_buffer.speech_stopped') userSpeaking = false;
     if (e.type === 'session.updated') {
       upstreamReady = true;
       sendRecapOnce();
@@ -232,10 +358,10 @@ wss.on('connection', (client) => {
     if (e.type === 'conversation.item.created' && process.env.JARVIS_DEBUG) {
       console.log('[item]', e.item?.role, JSON.stringify(e.item?.content)?.slice(0, 100));
     }
-    if (e.type === 'response.created') responseActive = true;
-    if (e.type === 'response.done') responseFinished();
+    if (e.type === 'response.created') responseStarted();
     if (e.type === 'conversation.item.input_audio_transcription.completed') record('you', e.transcript);
-    if (e.type === 'response.audio_transcript.done') record('jarvis', e.transcript);
+    if (e.type === 'response.audio_transcript.done') record('jarvis', cutting && e.transcript ? `${e.transcript} [cut off]` : e.transcript);
+    if (e.type === 'response.done') responseFinished(e.response);
 
     // Everything else streams to the phone untouched (audio, transcripts, state).
     toPhone(e);
@@ -279,13 +405,14 @@ wss.on('connection', (client) => {
     if (e.type === 'jarvis.session.delete') { sessions.deleteConversation(e.id); pushSessions(); return; }
     if (e.type === 'jarvis.jobs.refresh') { pushJobs(); return; }
     if (e.type === 'jarvis.voice') { toModel({ type: 'session.update', session: { voice: e.voice } }); return; }
-    if (e.type === 'jarvis.vad') { toModel({ type: 'session.update', session: { turn_detection: e.enabled ? { type: 'server_vad', threshold: 0.3, silence_duration_ms: 700 } : null } }); return; }
+    if (e.type === 'jarvis.vad') { toModel({ type: 'session.update', session: { turn_detection: e.enabled ? TURN_DETECTION : null } }); return; }
     if (e.type === 'input_audio_buffer.append') lastAudioAt = Date.now();
     // Typed turns count as conversation too; system injections do not.
     if (e.type === 'conversation.item.create' && e.item?.role === 'user') {
       const text = e.item.content?.find((c) => c.type === 'input_text')?.text || '';
       if (text && !text.startsWith('[SYSTEM EVENT') && !text.startsWith('[SESSION RECAP')) record('you', text);
     }
+    if (e.type === 'input_audio_buffer.commit' || e.type === 'conversation.item.create') unanswered++;
     if (e.type === 'response.create') { requestResponse(); return; }
     if (CLIENT_ALLOWED.has(e.type)) toModel(e);
   });

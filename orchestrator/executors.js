@@ -87,7 +87,7 @@ function parseLine(cli, line) {
     }
     if (e.type === 'result') {
       return {
-        kind: 'result', text: (e.result || '').slice(0, 2000), error: !!e.is_error,
+        kind: 'result', text: (e.result || '').slice(0, 20000), error: !!e.is_error,
         cost: e.total_cost_usd, ms: e.duration_ms,
         usage: e.usage ? {
           input: e.usage.input_tokens, output: e.usage.output_tokens,
@@ -105,7 +105,7 @@ function parseLine(cli, line) {
       case 'item.completed': {
         const item = e.item || {};
         if (item.type === 'agent_message' && item.text?.trim()) {
-          return { kind: 'text', text: item.text.trim().slice(0, 2000) };
+          return { kind: 'text', text: item.text.trim().slice(0, 20000) };
         }
         if (item.type === 'file_change' && e.type === 'item.started') {
           const files = (item.changes || []).map((c) => short(c.path)).slice(0, 3).join(', ');
