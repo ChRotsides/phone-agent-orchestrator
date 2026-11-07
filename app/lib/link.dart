@@ -66,7 +66,7 @@ class JarvisLink extends ChangeNotifier {
   LinkState state = LinkState.offline;
   String status = 'offline';
   String diag = '';
-  String host = '192.168.0.226:8443';
+  String host = '192.168.1.100:8443'; // set your PC's address in the app
   bool muted = false;
   bool speaker = true;
   bool aec = false;

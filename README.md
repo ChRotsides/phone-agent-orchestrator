@@ -13,6 +13,21 @@ tells you when it's done — or merges it into main when you say so.
                           └─────────────────────────┘        └──────────────────┘
 ```
 
+<img src="docs/images/console.png" alt="JARVIS debug console: a glowing voice orb, OFFLINE status and an ENGAGE button" width="260" align="right">
+
+**What it demonstrates**
+
+- **Realtime voice agent with function calling.** Speech in, speech out over a websocket relay, with
+  barge-in, echo-safe playback and tool calls; Qwen and OpenAI realtime models behind one protocol.
+- **LLM routing across coding agents.** A Qwen orchestrator picks Claude Code, Codex or Qoder for each
+  job, honours spoken overrides, and benches an executor for 30 minutes when it hits a rate limit.
+- **Safe autonomy.** Every job runs in its own git worktree and branch; nothing touches your working
+  tree until you say "merge it".
+- **Cost-aware sessions.** Follow-ups resume the same agent session while the prompt cache is warm
+  (measured below: 46,946 cached tokens read vs 2 fresh input tokens).
+
+<br clear="right">
+
 The phone only streams audio. The persona, the tools, the API key and all orchestration live on
 the PC, so the app never changes when the brain does.
 
@@ -23,13 +38,18 @@ npm start                       # HTTPS host + voice relay on :8443
 ```
 
 Then open the app on the phone (or `https://<pc-ip>:8443/` in Chrome for the debug console) and
-press **ENGAGE**. The certificate is self-signed; accept the warning once.
+press **ENGAGE**. The certificate is self-signed; accept the warning once. In the app, set the host to your PC's
+address (it is saved on the phone).
 
 `.env`:
 
 | key | meaning |
 |---|---|
-| `QWEN_API_KEY` | Token Plan key (`sk-sp-…`) |
+| `OPENAI_API_KEY` | when set, the voice runs on OpenAI's realtime model instead of Qwen |
+| `OPENAI_REALTIME_MODEL` | default `gpt-realtime-2.1` |
+| `OPENAI_VOICE` | `cedar` (default) or `marin`, `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse` |
+| `VOICE_PROVIDER` | force `openai` or `qwen`; otherwise OpenAI whenever its key is set |
+| `QWEN_API_KEY` | Token Plan key (`sk-sp-…`); also used by the task router |
 | `QWEN_REALTIME_URL` | realtime websocket + model |
 | `JARVIS_VOICE` | `daniel` (also `loongjohn`, `echo`, `hannah`, `sherry`, `loongmary`, …) |
 | `PROJECT_ROOTS` | colon-separated dirs to resolve spoken project names against |
@@ -112,3 +132,12 @@ app/lib/link.dart       websocket + native audio + all client state
 app/lib/main.dart       voice / jobs / sessions views
 public/                 browser debug console (same protocol as the app)
 ```
+
+## License
+
+This project is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE): free for personal,
+research, education and other noncommercial use. It is source-available, not an OSI-approved
+open-source license.
+
+**Commercial use requires a separate license.** Contact Charalambos Rotsides at
+[lhampis@gmail.com](mailto:lhampis@gmail.com).

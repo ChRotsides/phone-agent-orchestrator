@@ -14,12 +14,21 @@ import * as sessions from './orchestrator/sessions.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8443);
-const API_KEY = process.env.QWEN_API_KEY;
-const UPSTREAM = process.env.QWEN_REALTIME_URL;
-const VOICE = process.env.JARVIS_VOICE || 'daniel';
+// Voice provider: OpenAI's realtime model when its key is set, otherwise Qwen. Both speak
+// the same realtime protocol; OpenAI's differences are adapted at the edges below.
+const PROVIDER = process.env.VOICE_PROVIDER || (process.env.OPENAI_API_KEY ? 'openai' : 'qwen');
+const OPENAI = PROVIDER === 'openai';
+const OPENAI_VOICES = new Set(['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse', 'marin', 'cedar']);
+const API_KEY = OPENAI ? process.env.OPENAI_API_KEY : process.env.QWEN_API_KEY;
+const UPSTREAM = OPENAI
+  ? `wss://api.openai.com/v1/realtime?model=${process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-2.1'}`
+  : process.env.QWEN_REALTIME_URL;
+const VOICE = OPENAI
+  ? (OPENAI_VOICES.has(process.env.OPENAI_VOICE) ? process.env.OPENAI_VOICE : 'cedar')
+  : process.env.JARVIS_VOICE || 'daniel';
 
 if (!API_KEY || !UPSTREAM) {
-  console.error('Missing QWEN_API_KEY or QWEN_REALTIME_URL in .env');
+  console.error(OPENAI ? 'Missing OPENAI_API_KEY in .env' : 'Missing QWEN_API_KEY or QWEN_REALTIME_URL in .env');
   process.exit(1);
 }
 
@@ -85,6 +94,63 @@ filter word rather than guessing. If a tool returns a question, ask it in your o
 
 // Silence that ends the user's turn. Long enough to survive a mid-sentence pause.
 const TURN_DETECTION = { type: 'server_vad', threshold: 0.55, silence_duration_ms: 1200 };
+
+// OpenAI nests audio settings under session.audio and needs session.type; Qwen takes them flat.
+const sessionConfig = () => (OPENAI
+  ? {
+      type: 'realtime',
+      output_modalities: ['audio'],
+      instructions: INSTRUCTIONS,
+      audio: {
+        input: {
+          format: { type: 'audio/pcm', rate: 24000 },
+          transcription: { model: 'gpt-4o-mini-transcribe', language: 'en' },
+          turn_detection: TURN_DETECTION,
+        },
+        output: { format: { type: 'audio/pcm', rate: 24000 }, voice: VOICE },
+      },
+      tools: toolSchemas,
+      tool_choice: 'auto',
+    }
+  : {
+      modalities: ['text', 'audio'],
+      instructions: INSTRUCTIONS,
+      voice: VOICE,
+      input_audio_format: 'pcm16',
+      output_audio_format: 'pcm16',
+      input_audio_transcription: { model: 'fun-asr' },
+      turn_detection: TURN_DETECTION,
+      tools: toolSchemas,
+      tool_choice: 'auto',
+    });
+const voiceUpdate = (voice) => (OPENAI ? { type: 'realtime', audio: { output: { voice } } } : { voice });
+const vadUpdate = (td) => (OPENAI ? { type: 'realtime', audio: { input: { turn_detection: td } } } : { turn_detection: td });
+
+// The phone and its app speak the original event names; OpenAI renamed the output ones.
+const LEGACY_EVENTS = {
+  'response.output_audio.delta': 'response.audio.delta',
+  'response.output_audio.done': 'response.audio.done',
+  'response.output_audio_transcript.delta': 'response.audio_transcript.delta',
+  'response.output_audio_transcript.done': 'response.audio_transcript.done',
+  'response.output_text.delta': 'response.text.delta',
+  'response.output_text.done': 'response.text.done',
+};
+
+// The phone records 16 kHz PCM16; OpenAI only accepts 24 kHz. Linear interpolation is
+// plenty for speech going into a recogniser.
+function upsample16to24(b64) {
+  const src = Buffer.from(b64, 'base64');
+  const n = src.length >> 1;
+  const m = Math.floor((n * 3) / 2);
+  const out = Buffer.alloc(m * 2);
+  for (let i = 0; i < m; i++) {
+    const x = (i * 2) / 3, j = Math.floor(x), f = x - j;
+    const a = src.readInt16LE(j * 2);
+    const b = j + 1 < n ? src.readInt16LE((j + 1) * 2) : a;
+    out.writeInt16LE(Math.round(a + (b - a) * f), i * 2);
+  }
+  return out.toString('base64');
+}
 
 const app = express();
 app.use(express.json());
@@ -273,20 +339,7 @@ wss.on('connection', (client) => {
   };
 
   upstream.on('open', () => {
-    sendNow({
-      type: 'session.update',
-      session: {
-        modalities: ['text', 'audio'],
-        instructions: INSTRUCTIONS,
-        voice: VOICE,
-        input_audio_format: 'pcm16',
-        output_audio_format: 'pcm16',
-        input_audio_transcription: { model: 'fun-asr' },
-        turn_detection: TURN_DETECTION,
-        tools: toolSchemas,
-        tool_choice: 'auto',
-      },
-    });
+    sendNow({ type: 'session.update', session: sessionConfig() });
     for (const m of pending.splice(0)) upstream.send(m);
 
     pushCurrent();
@@ -308,7 +361,16 @@ wss.on('connection', (client) => {
   bus.on('job', onJob);
 
   upstream.on('message', async (raw) => {
-    const e = JSON.parse(raw.toString());
+    let e = JSON.parse(raw.toString());
+    if (OPENAI) {
+      if (LEGACY_EVENTS[e.type]) e.type = LEGACY_EVENTS[e.type];
+      // OpenAI's tool call is complete, name included, on output_item.done; reshape it into
+      // the event the tool path below already handles, and drop the nameless one.
+      if (e.type === 'response.function_call_arguments.done') return;
+      if (e.type === 'response.output_item.done' && e.item?.type === 'function_call') {
+        e = { type: 'response.function_call_arguments.done', name: e.item.name, call_id: e.item.call_id, arguments: e.item.arguments };
+      }
+    }
 
     if (e.type === 'response.function_call_arguments.done') {
       let args = {};
@@ -404,9 +466,16 @@ wss.on('connection', (client) => {
     if (e.type === 'jarvis.session.rename') { sessions.renameConversation(e.id, e.name); pushSessions(); return; }
     if (e.type === 'jarvis.session.delete') { sessions.deleteConversation(e.id); pushSessions(); return; }
     if (e.type === 'jarvis.jobs.refresh') { pushJobs(); return; }
-    if (e.type === 'jarvis.voice') { toModel({ type: 'session.update', session: { voice: e.voice } }); return; }
-    if (e.type === 'jarvis.vad') { toModel({ type: 'session.update', session: { turn_detection: e.enabled ? TURN_DETECTION : null } }); return; }
-    if (e.type === 'input_audio_buffer.append') lastAudioAt = Date.now();
+    if (e.type === 'jarvis.voice') {
+      // The phone's voice list is Qwen's; OpenAI ignores names it doesn't have.
+      if (!OPENAI || OPENAI_VOICES.has(e.voice)) toModel({ type: 'session.update', session: voiceUpdate(e.voice) });
+      return;
+    }
+    if (e.type === 'jarvis.vad') { toModel({ type: 'session.update', session: vadUpdate(e.enabled ? TURN_DETECTION : null) }); return; }
+    if (e.type === 'input_audio_buffer.append') {
+      lastAudioAt = Date.now();
+      if (OPENAI && e.audio) e.audio = upsample16to24(e.audio);
+    }
     // Typed turns count as conversation too; system injections do not.
     if (e.type === 'conversation.item.create' && e.item?.role === 'user') {
       const text = e.item.content?.find((c) => c.type === 'input_text')?.text || '';
@@ -419,7 +488,7 @@ wss.on('connection', (client) => {
 
   // Silence keepalive: the upstream closes a session idle for 180s, which would drop
   // the link exactly while a long job is running.
-  const silence = Buffer.alloc(16000 * 2 * 0.2).toString('base64'); // 200 ms of 16 kHz PCM16
+  const silence = Buffer.alloc((OPENAI ? 24000 : 16000) * 2 * 0.2).toString('base64'); // 200 ms of PCM16, sent as-is
   const keepalive = setInterval(() => {
     if (Date.now() - lastAudioAt > 25_000) toModel({ type: 'input_audio_buffer.append', audio: silence });
   }, 20_000);
@@ -434,5 +503,5 @@ wss.on('connection', (client) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`JARVIS host listening on :${PORT}`);
-  console.log(`Voice model: ${UPSTREAM.split('model=')[1]}  ·  voice: ${VOICE}`);
+  console.log(`Voice model: ${PROVIDER} ${UPSTREAM.split('model=')[1]}  ·  voice: ${VOICE}`);
 });
