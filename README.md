@@ -140,4 +140,4 @@ research, education and other noncommercial use. It is source-available, not an 
 open-source license.
 
 **Commercial use requires a separate license.** Contact Charalambos Rotsides at
-[lhampis@gmail.com](mailto:lhampis@gmail.com).
+[charalambosrotsides@gmail.com](mailto:charalambosrotsides@gmail.com) or [charalambosrotsides@outlook.com](mailto:charalambosrotsides@outlook.com).
